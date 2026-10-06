@@ -143,6 +143,8 @@
 #![deny(missing_docs)]
 
 use crate::pwr::PowerConfiguration;
+#[cfg(all(feature = "revision_v", feature = "rm0433"))]
+use crate::pwr::H743FlightPower;
 use crate::pwr::VoltageScale as Voltage;
 use crate::stm32::rcc::cfgr::SW_A as SW;
 use crate::stm32::rcc::cfgr::TIMPRE_A as TIMPRE;
@@ -239,6 +241,130 @@ pub struct Rcc {
 }
 
 impl Rcc {
+    /// Configure the fixed STM32H743 flight clock tree.
+    ///
+    /// The configuration is HSI (64 MHz) to PLL1, then SYSCLK 480 MHz, HCLK
+    /// 240 MHz, APB1--4 120 MHz, and PLL1-Q 32 MHz.  There are no caller
+    /// supplied frequencies or divisors.  [`crate::pwr::Pwr::freeze_h743_flight_vos0`]
+    /// supplies the required VOS0 proof.
+    #[cfg(all(feature = "revision_v", feature = "rm0433"))]
+    pub fn freeze_h743_flight(
+        self,
+        _power: H743FlightPower,
+        syscfg: &SYSCFG,
+    ) -> Ccdr {
+        const SYSCLK: u32 = 480_000_000;
+        const HCLK: u32 = 240_000_000;
+        const PCLK: u32 = 120_000_000;
+        const PLL1_Q: u32 = 32_000_000;
+
+        let rcc = &self.rb;
+
+        // The fixed flight configuration is VOS0, so this has no dynamic
+        // voltage or frequency decision.
+        Self::flash_setup(HCLK, Voltage::Scale0);
+
+        rcc.cr.modify(|_, w| w.hsion().on().csion().on().hsi48on().on());
+        while rcc.cr.read().csirdy().is_not_ready() {}
+        while rcc.cr.read().hsi48rdy().is_not_ready() {}
+        rcc.csr.modify(|_, w| w.lsion().on());
+        while rcc.csr.read().lsirdy().is_not_ready() {}
+
+        rcc.pllckselr.modify(|_, w| {
+            w.pllsrc().variant(PLLSRC::Hsi).divm1().bits(4)
+        });
+        rcc.pllcfgr.modify(|_, w| {
+            w.pll1vcosel()
+                .wide_vco()
+                .pll1rge()
+                .range8()
+                .pll1fracen()
+                .reset()
+                .divp1en()
+                .enabled()
+                .divq1en()
+                .enabled()
+                .divr1en()
+                .disabled()
+        });
+        rcc.pll1divr.modify(|_, w| unsafe {
+            // HSI / 4 * 60 = 960 MHz; P / 2 = 480 MHz; Q / 30 = 32 MHz.
+            w.divn1().bits(59).divp1().bits(1).divq1().bits(29).divr1().bits(0)
+        });
+        rcc.cr.modify(|_, w| w.pll1on().on());
+        while rcc.cr.read().pll1rdy().is_not_ready() {}
+
+        rcc.d1cfgr.modify(|_, w| unsafe {
+            w.d1cpre().bits(0).d1ppre().bits(0b100).hpre().variant(HPRE::Div2)
+        });
+        while rcc.d1cfgr.read().d1cpre().bits() != 0 {}
+        rcc.d2cfgr.modify(|_, w| unsafe {
+            w.d2ppre1().bits(0b100).d2ppre2().bits(0b100)
+        });
+        rcc.d3cfgr.modify(|_, w| unsafe { w.d3ppre().bits(0b100) });
+        // SPI1/2/3 run from the fixed 32 MHz PLL1-Q output.
+        rcc.d2ccip1r.modify(|_, w| w.spi123sel().pll1_q());
+        rcc.d1ccipr.modify(|_, w| w.ckpersel().variant(CKPERSEL::Hsi));
+        rcc.cfgr.modify(|_, w| {
+            w.timpre()
+                .variant(TIMPRE::DefaultX2)
+                .mco1()
+                .variant(MCO1::Hsi)
+                .mco1pre()
+                .bits(0)
+                .mco2()
+                .variant(MCO2::Sysclk)
+                .mco2pre()
+                .bits(0)
+        });
+
+        rcc.cfgr.modify(|_, w| unsafe { w.sw().bits(SW::Pll1 as u8) });
+        while rcc.cfgr.read().sws().bits() != SW::Pll1 as u8 {}
+
+        rcc.apb4enr.modify(|_, w| w.syscfgen().enabled());
+        syscfg.cccsr.modify(|_, w| {
+            w.en().set_bit().cs().clear_bit().hslv().clear_bit()
+        });
+        while syscfg.cccsr.read().ready().bit_is_clear() {}
+
+        Ccdr {
+            clocks: CoreClocks {
+                hclk: Hertz::from_raw(HCLK),
+                pclk1: Hertz::from_raw(PCLK),
+                pclk2: Hertz::from_raw(PCLK),
+                pclk3: Hertz::from_raw(PCLK),
+                pclk4: Hertz::from_raw(PCLK),
+                ppre1: 2,
+                ppre2: 2,
+                ppre3: 2,
+                ppre4: 2,
+                csi_ck: Some(Hertz::from_raw(CSI)),
+                hsi_ck: Some(Hertz::from_raw(HSI)),
+                hsi48_ck: Some(Hertz::from_raw(HSI48)),
+                lsi_ck: Some(Hertz::from_raw(LSI)),
+                per_ck: Some(Hertz::from_raw(HSI)),
+                hse_ck: None,
+                mco1_ck: None,
+                mco2_ck: None,
+                pll1_p_ck: Some(Hertz::from_raw(SYSCLK)),
+                pll1_q_ck: Some(Hertz::from_raw(PLL1_Q)),
+                pll1_r_ck: None,
+                pll2_p_ck: None,
+                pll2_q_ck: None,
+                pll2_r_ck: None,
+                pll3_p_ck: None,
+                pll3_q_ck: None,
+                pll3_r_ck: None,
+                timx_ker_ck: Hertz::from_raw(HCLK),
+                timy_ker_ck: Hertz::from_raw(HCLK),
+                sys_ck: Hertz::from_raw(SYSCLK),
+                c_ck: Hertz::from_raw(SYSCLK),
+            },
+            peripheral: unsafe { PeripheralREC::new_singleton() },
+            rb: self.rb,
+        }
+    }
+
     /// Gets and clears the reason of why the mcu was reset
     pub fn get_reset_reason(&mut self) -> ResetReason {
         reset_reason::get_reset_reason(&mut self.rb)

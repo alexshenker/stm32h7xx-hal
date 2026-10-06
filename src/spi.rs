@@ -82,7 +82,7 @@ use crate::stm32::spi1::{
     cfg1::MBR_A as MBR, cfg2::COMM_A as COMM, cfg2::SSIOP_A as SSIOP,
 };
 use crate::stm32::{SPI1, SPI2, SPI3, SPI4, SPI5, SPI6};
-use crate::time::Hertz;
+use crate::time::{Hertz, NonZeroHertz};
 
 /// SPI error
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -556,6 +556,29 @@ pub trait SpiExt<SPI, WORD>: Sized {
         CONFIG: Into<Config>;
 }
 
+/// SPI construction that cannot receive a zero clock divisor.
+///
+/// The caller supplies the already-selected kernel clock rather than a
+/// general clock tree. Flight code uses this API; the legacy [`SpiExt`] API
+/// remains available for programs that accept panic-on-misconfiguration.
+pub trait SafeSpiExt<SPI, WORD>: Sized {
+    /// Peripheral reset and clock-enable control.
+    type Rec: ResetEnable;
+
+    /// Configure SPI from non-zero requested and kernel clock rates.
+    fn spi_safe<PINS, CONFIG>(
+        self,
+        pins: PINS,
+        config: CONFIG,
+        requested: NonZeroHertz,
+        kernel: NonZeroHertz,
+        prec: Self::Rec,
+    ) -> Spi<SPI, Enabled, WORD>
+    where
+        PINS: Pins<SPI>,
+        CONFIG: Into<Config>;
+}
+
 pub trait HalEnabledSpi:
     HalSpi + FullDuplex<Self::Word, Error = Error>
 {
@@ -706,6 +729,39 @@ macro_rules! spi {
                     where
                         CONFIG: Into<Config>,
                     {
+                        let kernel = Self::kernel_clk_unwrap(clocks);
+                        Self::from_kernel(spi, config, freq, kernel, prec)
+                    }
+
+                    fn from_kernel_safe<CONFIG>(
+                        spi: $SPIX,
+                        config: CONFIG,
+                        requested: NonZeroHertz,
+                        kernel: NonZeroHertz,
+                        prec: rec::$Rec,
+                    ) -> Self
+                    where
+                        CONFIG: Into<Config>,
+                    {
+                        Self::from_kernel(
+                            spi,
+                            config,
+                            requested.hertz(),
+                            kernel.hertz(),
+                            prec,
+                        )
+                    }
+
+                    fn from_kernel<CONFIG>(
+                        spi: $SPIX,
+                        config: CONFIG,
+                        freq: Hertz,
+                        spi_ker_ck: Hertz,
+                        prec: rec::$Rec,
+                    ) -> Self
+                    where
+                        CONFIG: Into<Config>,
+                    {
                         // Enable clock for SPI
                         let _ = prec.enable(); // drop, can be recreated by free method
 
@@ -715,7 +771,7 @@ macro_rules! spi {
                         let config: Config = config.into();
 
                         let spi_freq = freq.raw();
-	                    let spi_ker_ck = Self::kernel_clk_unwrap(clocks).raw();
+                        let spi_ker_ck = spi_ker_ck.raw();
                         let mbr = match (spi_ker_ck + spi_freq - 1) / spi_freq {
                             1..=2 => MBR::Div2,
                             3..=4 => MBR::Div4,
@@ -1096,6 +1152,31 @@ macro_rules! spi {
                                 return Ok(());
                             }
                         })
+                    }
+                }
+
+                impl SafeSpiExt<$SPIX, $TY> for $SPIX {
+                    type Rec = rec::$Rec;
+
+                    fn spi_safe<PINS, CONFIG>(
+                        self,
+                        _pins: PINS,
+                        config: CONFIG,
+                        requested: NonZeroHertz,
+                        kernel: NonZeroHertz,
+                        prec: rec::$Rec,
+                    ) -> Spi<$SPIX, Enabled, $TY>
+                    where
+                        PINS: Pins<$SPIX>,
+                        CONFIG: Into<Config>,
+                    {
+                        Spi::<$SPIX, Enabled, $TY>::from_kernel_safe(
+                            self,
+                            config,
+                            requested,
+                            kernel,
+                            prec,
+                        )
                     }
                 }
 

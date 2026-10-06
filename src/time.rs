@@ -7,10 +7,35 @@ pub use fugit::{
 };
 
 //use core::time::Duration;
+use core::num::NonZeroU32;
 use cortex_m::peripheral::DWT;
 
 /// Bits per second
 pub type Bps = Hertz;
+
+/// A clock rate that cannot be zero.
+///
+/// Use this at every clock-divider boundary. A caller must provide a
+/// [`NonZeroU32`], so a zero divisor cannot reach the hardware setup code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NonZeroHertz(NonZeroU32);
+
+impl NonZeroHertz {
+    /// Create a non-zero rate from its raw Hertz value.
+    pub const fn new(raw: NonZeroU32) -> Self {
+        Self(raw)
+    }
+
+    /// Return the raw non-zero Hertz value.
+    pub const fn raw(self) -> NonZeroU32 {
+        self.0
+    }
+
+    /// Convert to the general-purpose Hertz type.
+    pub const fn hertz(self) -> Hertz {
+        Hertz::from_raw(self.0.get())
+    }
+}
 
 /// Extension trait that adds convenience methods to the `u32` type
 pub trait U32Ext {

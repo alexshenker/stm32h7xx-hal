@@ -143,6 +143,14 @@ pub struct PowerConfiguration {
     pub(crate) backup: Option<BackupREC>,
 }
 
+/// Proof that the fixed STM32H743 flight power configuration is active.
+///
+/// This is produced only by [`Pwr::freeze_h743_flight_vos0`].  Its private
+/// field prevents callers from selecting a clock tree that is unsafe for the
+/// configured voltage range.
+#[cfg(all(feature = "revision_v", feature = "rm0433"))]
+pub struct H743FlightPower(());
+
 impl PowerConfiguration {
     /// Gets the `VoltageScale` which was configured by `Pwr::freeze()`.
     pub fn vos(&self) -> VoltageScale {
@@ -264,6 +272,30 @@ pub(crate) fn current_vos() -> VoltageScale {
 
 /// Internal power methods
 impl Pwr {
+    /// Select the fixed STM32H743 flight voltage configuration.
+    ///
+    /// This configures the LDO supply and VOS0 directly.  It accepts no
+    /// caller-selected values and contains no assertion or panic path.
+    #[cfg(all(feature = "revision_v", feature = "rm0433"))]
+    pub fn freeze_h743_flight_vos0(self, syscfg: &SYSCFG) -> H743FlightPower {
+        self.rb.cr3.modify(|_, w| {
+            w.scuen().set_bit().ldoen().set_bit().bypass().clear_bit()
+        });
+        while self.rb.csr1.read().actvosrdy().bit_is_clear() {}
+
+        // VOS0 is reached through VOS1 on RM0433 revision-V devices.
+        self.rb.d3cr.write(|w| unsafe { w.vos().bits(0b11) });
+        while self.rb.d3cr.read().vosrdy().bit_is_clear() {}
+
+        unsafe {
+            (*RCC::ptr()).apb4enr.modify(|_, w| w.syscfgen().enabled());
+        }
+        syscfg.pwrcr.modify(|_, w| w.oden().set_bit());
+        while self.rb.d3cr.read().vosrdy().bit_is_clear() {}
+
+        H743FlightPower(())
+    }
+
     /// Verify that the lower byte of CR3 reads as written
     #[cfg(feature = "smps")]
     fn verify_supply_configuration(&self) {
